@@ -29,6 +29,41 @@ def _create_default_icon():
     return img
 
 
+def _save_icon_to_temp() -> str:
+    """Save the tray icon to a temp file and return its path (needed by AppIndicator)."""
+    import tempfile
+    import os
+
+    img = _create_default_icon()
+    fd, path = tempfile.mkstemp(suffix=".png", prefix="h4kshot_icon_")
+    os.close(fd)
+    img.save(path, "PNG")
+    return path
+
+
+def _ensure_gi_importable():
+    """Make sure PyGObject (gi) is importable even inside a venv."""
+    try:
+        import gi  # noqa: F401
+    except ImportError:
+        for extra in ["/usr/lib/python3/dist-packages", "/usr/lib64/python3/dist-packages"]:
+            if extra not in sys.path:
+                sys.path.insert(0, extra)
+
+
+def _is_gtk_available() -> bool:
+    """Check if GTK3 + AppIndicator are available (Linux)."""
+    try:
+        _ensure_gi_importable()
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import Gtk, AyatanaAppIndicator3  # noqa: F401
+        return True
+    except (ImportError, ValueError):
+        return False
+
+
 class H4KShotApp:
     """Main application managing the tray icon, hotkeys, and capture logic."""
 
@@ -94,7 +129,7 @@ class H4KShotApp:
     @staticmethod
     def _notify(message: str) -> None:
         """Show a desktop notification (best-effort, non-blocking)."""
-        print(f"[h4kshot] {message}")
+        print(f"[h4kshot] {message}", flush=True)
         try:
             system = platform.system()
             if system == "Linux":
@@ -121,14 +156,13 @@ class H4KShotApp:
     # Hotkey management
     # ------------------------------------------------------------------ #
     def _parse_hotkey(self, hotkey_str: str):
-        """Parse a hotkey string like '<alt>+<print_screen>' into a pynput HotKey set."""
-        from pynput.keyboard import HotKey, Key, KeyCode
+        """Parse a hotkey string like '<alt>+<print_screen>' into a pynput key list."""
+        from pynput.keyboard import Key, KeyCode
 
         parts = [p.strip() for p in hotkey_str.split("+")]
         keys = []
         for part in parts:
             part_lower = part.lower().strip("<>")
-            # Map common names to pynput Keys
             key_map = {
                 "alt": Key.alt,
                 "alt_l": Key.alt_l,
@@ -149,7 +183,6 @@ class H4KShotApp:
             elif len(part_lower) == 1:
                 keys.append(KeyCode.from_char(part_lower))
             else:
-                # Try as Key attribute
                 try:
                     keys.append(getattr(Key, part_lower))
                 except AttributeError:
@@ -194,13 +227,78 @@ class H4KShotApp:
             self._hotkey_listener = None
 
     # ------------------------------------------------------------------ #
-    # Keybinding change dialog (Tkinter for cross-platform support)
+    # Keybinding change dialog
     # ------------------------------------------------------------------ #
-    def _open_keybinding_dialog(self, icon=None, item=None) -> None:
-        """Open a simple Tkinter dialog to change keybindings."""
-        threading.Thread(target=self._keybinding_dialog_thread, daemon=True).start()
+    def _open_keybinding_dialog(self, *_args) -> None:
+        """Open a dialog to change keybindings.
 
-    def _keybinding_dialog_thread(self) -> None:
+        Uses GTK on Linux (if available) or Tkinter elsewhere.
+        """
+        system = platform.system()
+        if system == "Linux" and _is_gtk_available():
+            # GTK dialog must run on the main thread via GLib.idle_add
+            # but we're called from a menu signal, so it's already on the GTK thread
+            self._keybinding_dialog_gtk()
+        else:
+            threading.Thread(target=self._keybinding_dialog_tk, daemon=True).start()
+
+    def _keybinding_dialog_gtk(self) -> None:
+        """GTK3 keybinding dialog for Linux."""
+        _ensure_gi_importable()
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+
+        dialog = Gtk.Dialog(
+            title="H4KShot – Keybindings",
+            flags=0,
+        )
+        dialog.set_default_size(450, 180)
+        dialog.set_resizable(False)
+        dialog.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Save", Gtk.ResponseType.OK)
+
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_start(15)
+        content.set_margin_end(15)
+        content.set_margin_top(10)
+
+        # Screenshot hotkey
+        hbox1 = Gtk.Box(spacing=10)
+        lbl1 = Gtk.Label(label="Screenshot Hotkey:")
+        hbox1.pack_start(lbl1, False, False, 0)
+        screenshot_entry = Gtk.Entry()
+        screenshot_entry.set_text(self.config["screenshot_hotkey"])
+        screenshot_entry.set_hexpand(True)
+        hbox1.pack_start(screenshot_entry, True, True, 0)
+        content.pack_start(hbox1, False, False, 5)
+
+        # Record hotkey
+        hbox2 = Gtk.Box(spacing=10)
+        lbl2 = Gtk.Label(label="Record Hotkey:")
+        hbox2.pack_start(lbl2, False, False, 0)
+        record_entry = Gtk.Entry()
+        record_entry.set_text(self.config["record_hotkey"])
+        record_entry.set_hexpand(True)
+        hbox2.pack_start(record_entry, True, True, 0)
+        content.pack_start(hbox2, False, False, 5)
+
+        dialog.show_all()
+        response = dialog.run()
+
+        if response == Gtk.ResponseType.OK:
+            self.config["screenshot_hotkey"] = screenshot_entry.get_text()
+            self.config["record_hotkey"] = record_entry.get_text()
+            save_config(self.config)
+            self._stop_hotkeys()
+            self._start_hotkeys()
+            self._notify("Keybindings saved! New hotkeys are active.")
+
+        dialog.destroy()
+
+    def _keybinding_dialog_tk(self) -> None:
+        """Tkinter keybinding dialog (macOS / Windows / fallback)."""
         import tkinter as tk
         from tkinter import messagebox
 
@@ -208,6 +306,11 @@ class H4KShotApp:
         root.title("H4KShot – Keybindings")
         root.geometry("420x200")
         root.resizable(False, False)
+
+        # Bring to front
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
 
         tk.Label(root, text="Screenshot Hotkey:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
         screenshot_var = tk.StringVar(value=self.config["screenshot_hotkey"])
@@ -221,42 +324,103 @@ class H4KShotApp:
             self.config["screenshot_hotkey"] = screenshot_var.get()
             self.config["record_hotkey"] = record_var.get()
             save_config(self.config)
-            # Restart hotkeys
             self._stop_hotkeys()
             self._start_hotkeys()
             messagebox.showinfo("H4KShot", "Keybindings saved! New hotkeys are active.")
             root.destroy()
 
-        tk.Button(root, text="Save", command=on_save, width=12).grid(row=2, column=0, columnspan=2, pady=15)
+        tk.Button(root, text="Save", command=on_save, width=12).grid(
+            row=2, column=0, columnspan=2, pady=15
+        )
 
         root.mainloop()
 
     # ------------------------------------------------------------------ #
     # Tray icon
     # ------------------------------------------------------------------ #
-    def _quit(self, icon=None, item=None) -> None:
+    def _quit(self, *_args) -> None:
         """Exit the application."""
         self._stop_hotkeys()
         if self._tray_icon:
-            self._tray_icon.stop()
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
         sys.exit(0)
 
     def run(self) -> None:
-        """Start the application: tray icon + hotkey listener."""
-        import pystray
-        from pystray import MenuItem
+        """Start the application with the best available tray backend."""
+        system = platform.system()
 
         self._start_hotkeys()
+
+        if system == "Linux" and _is_gtk_available():
+            self._run_gtk_tray()
+        else:
+            self._run_pystray()
+
+    def _run_pystray(self) -> None:
+        """Run with pystray (works on macOS/Windows, fallback on Linux)."""
+        import pystray
+        from pystray import MenuItem
 
         icon_image = _create_default_icon()
         menu = pystray.Menu(
             MenuItem("Take Screenshot", lambda icon, item: self.take_screenshot()),
             MenuItem("Toggle Recording", lambda icon, item: self.toggle_recording()),
             pystray.Menu.SEPARATOR,
-            MenuItem("Change Keybindings", self._open_keybinding_dialog),
+            MenuItem("Change Keybindings", lambda icon, item: self._open_keybinding_dialog()),
             pystray.Menu.SEPARATOR,
-            MenuItem("Exit", self._quit),
+            MenuItem("Exit", lambda icon, item: self._quit()),
         )
 
         self._tray_icon = pystray.Icon("h4kshot", icon_image, "H4KShot", menu)
         self._tray_icon.run()
+
+    def _run_gtk_tray(self) -> None:
+        """Run with GTK3 AppIndicator (Linux – proper menu support)."""
+        _ensure_gi_importable()
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import Gtk, AyatanaAppIndicator3
+
+        # Save icon to temp file (AppIndicator needs a file path)
+        icon_path = _save_icon_to_temp()
+
+        indicator = AyatanaAppIndicator3.Indicator.new(
+            "h4kshot",
+            icon_path,
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        indicator.set_title("H4KShot")
+
+        # Build menu
+        menu = Gtk.Menu()
+
+        item_screenshot = Gtk.MenuItem(label="📸  Take Screenshot")
+        item_screenshot.connect("activate", lambda _: self.take_screenshot())
+        menu.append(item_screenshot)
+
+        item_record = Gtk.MenuItem(label="🎥  Toggle Recording")
+        item_record.connect("activate", lambda _: self.toggle_recording())
+        menu.append(item_record)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item_keybindings = Gtk.MenuItem(label="⌨️  Change Keybindings")
+        item_keybindings.connect("activate", lambda _: self._open_keybinding_dialog())
+        menu.append(item_keybindings)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        item_quit = Gtk.MenuItem(label="❌  Exit")
+        item_quit.connect("activate", lambda _: Gtk.main_quit())
+        menu.append(item_quit)
+
+        menu.show_all()
+        indicator.set_menu(menu)
+
+        self._tray_icon = indicator
+        Gtk.main()

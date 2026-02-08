@@ -16,7 +16,8 @@ Multiplatform screenshot/screen-recording utility with auto-upload to [s.h4ks.co
 
 - Python 3.9+
 - **ffmpeg** must be installed and on `PATH` for screen recording.
-- On Linux: `xdotool`, `xclip` or `xsel` for clipboard support.
+- On Linux: `xclip` or `xsel` for clipboard support.
+- On Linux (for tray menu): `gir1.2-gtk-3.0` and `gir1.2-ayatanaappindicator3-0.1` (Ubuntu/Debian).
 
 ## Installation
 
@@ -33,11 +34,21 @@ pip install -e ".[dev]"
 ## Usage
 
 ```bash
-h4kshot          # Launch from terminal
-h4kshot-gui      # Launch as GUI app (no console window on Windows)
+h4kshot              # Launch (foreground, tray icon appears)
+h4kshot --daemon     # Launch in background (Linux/macOS) – no terminal needed
+h4kshot --install    # Install as autostart service (runs on every login)
+h4kshot --uninstall  # Remove autostart service
 ```
 
 The app starts minimized to the system tray.
+
+### Running in the Background
+
+| Platform | Method |
+|----------|--------|
+| **Linux** | `h4kshot --install` creates a **systemd user service** that starts on login. Or use `h4kshot --daemon` to fork once. |
+| **macOS** | `h4kshot --install` creates a **launchd agent** (`~/Library/LaunchAgents/`). Or use `h4kshot --daemon`. |
+| **Windows** | `h4kshot --install` creates a **startup VBS script** so it runs on login without a console window. |
 
 ### Default Keybindings
 

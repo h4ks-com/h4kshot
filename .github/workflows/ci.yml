@@ -28,7 +28,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y xclip xvfb ffmpeg xdotool
+          sudo apt-get install -y xclip xvfb ffmpeg gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 python3-gi python3-gi-cairo
 
       - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
@@ -69,7 +69,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y xclip xvfb ffmpeg
+          sudo apt-get install -y xclip xvfb ffmpeg gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 python3-gi python3-gi-cairo
 
       - name: Install Python dependencies
         run: |
