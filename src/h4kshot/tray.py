@@ -15,7 +15,6 @@ from h4kshot.overlay import (
     MODE_FULLSCREEN,
     MODE_WINDOW,
     show_capture_toolbar,
-    show_stop_button,
 )
 from h4kshot.recorder import ScreenRecorder
 from h4kshot.screenshot import capture_region, capture_screenshot
@@ -37,12 +36,26 @@ def _create_default_icon():
     return img
 
 
-def _save_icon_to_temp() -> str:
-    """Save the tray icon to a temp file and return its path (needed by AppIndicator)."""
+def _create_stop_icon():
+    """Create a red circle stop-recording tray icon."""
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Red circle
+    draw.ellipse([4, 4, 60, 60], fill=(220, 30, 30, 255))
+    # White square (stop symbol)
+    draw.rectangle([20, 20, 44, 44], fill=(255, 255, 255, 255))
+    return img
+
+
+def _save_icon_to_temp(img=None) -> str:
+    """Save a tray icon to a temp file and return its path (needed by AppIndicator)."""
     import tempfile
     import os
 
-    img = _create_default_icon()
+    if img is None:
+        img = _create_default_icon()
     fd, path = tempfile.mkstemp(suffix=".png", prefix="h4kshot_icon_")
     os.close(fd)
     img.save(path, "PNG")
@@ -81,7 +94,8 @@ class H4KShotApp:
         self._is_recording = False
         self._hotkey_listener = None
         self._tray_icon = None
-        self._stop_button = None  # floating red stop button
+        self._stop_indicator = None  # second tray icon for stop-recording
+        self._using_gtk = False  # True when running with GTK main loop
 
     # ------------------------------------------------------------------ #
     # Upload helper
@@ -129,6 +143,15 @@ class H4KShotApp:
     # ------------------------------------------------------------------ #
     # Screen recording
     # ------------------------------------------------------------------ #
+    def _run_on_gtk_thread(self, func: callable) -> None:
+        """Schedule *func* to run on the GTK main thread (if using GTK)."""
+        if self._using_gtk:
+            _ensure_gi_importable()
+            from gi.repository import GLib
+            GLib.idle_add(func)
+        else:
+            func()
+
     def _start_recording(self, mode: str, region: CaptureRegion | None) -> None:
         """Start recording (called from overlay toolbar)."""
         if self._is_recording:
@@ -145,21 +168,13 @@ class H4KShotApp:
             self._is_recording = True
             self._notify("Recording started… (use hotkey, tray, or ⏹ button to stop)")
 
-            # Show floating red stop button
-            try:
-                self._stop_button = show_stop_button(self.toggle_recording)
-            except Exception:
-                pass  # non-fatal if the button fails to display
+            # Show a second tray icon (red circle) for stopping
+            self._run_on_gtk_thread(self._show_stop_tray_icon)
 
         except RuntimeError as e:
             self._notify(str(e))
 
-        self._update_gtk_record_items()
-        if self._tray_icon and hasattr(self._tray_icon, "update_menu"):
-            try:
-                self._tray_icon.update_menu()
-            except Exception:
-                pass
+        self._run_on_gtk_thread(self._update_gtk_record_items)
 
     def toggle_recording(self) -> None:
         """Start or stop screen recording."""
@@ -168,13 +183,8 @@ class H4KShotApp:
             output = self._recorder.stop()
             self._recorder = None
 
-            # Hide the floating stop button
-            if self._stop_button:
-                try:
-                    self._stop_button.destroy()
-                except Exception:
-                    pass
-                self._stop_button = None
+            # Hide the stop-recording tray icon
+            self._run_on_gtk_thread(self._hide_stop_tray_icon)
 
             self._notify("Recording stopped – uploading…")
             threading.Thread(target=self._upload_and_copy, args=(output,), daemon=True).start()
@@ -182,8 +192,8 @@ class H4KShotApp:
             # When triggered via hotkey (not toolbar), start fullscreen recording
             self._start_recording(MODE_FULLSCREEN, None)
 
-        # Update GTK tray menu items if they exist
-        self._update_gtk_record_items()
+        # Update GTK tray menu items
+        self._run_on_gtk_thread(self._update_gtk_record_items)
         # Update pystray menu (forces re-render of dynamic label)
         if self._tray_icon and hasattr(self._tray_icon, 'update_menu'):
             try:
@@ -192,7 +202,10 @@ class H4KShotApp:
                 pass
 
     def _update_gtk_record_items(self) -> None:
-        """Sync GTK menu item sensitivity with recording state."""
+        """Sync GTK menu item sensitivity with recording state.
+
+        MUST be called on the GTK main thread (use _run_on_gtk_thread).
+        """
         try:
             rec = getattr(self, '_gtk_item_record', None)
             stop = getattr(self, '_gtk_item_stop', None)
@@ -201,6 +214,66 @@ class H4KShotApp:
                 stop.set_sensitive(self._is_recording)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Stop-recording tray icon (second indicator)
+    # ------------------------------------------------------------------ #
+    def _show_stop_tray_icon(self) -> None:
+        """Show a second tray icon (red ⏹) for stopping the recording.
+
+        MUST be called on the GTK main thread.
+        """
+        if self._stop_indicator is not None:
+            return  # already visible
+
+        system = platform.system()
+        if system == "Linux" and _is_gtk_available():
+            self._show_stop_tray_icon_gtk()
+        # On macOS/Windows pystray handles it via the dynamic menu label
+
+    def _show_stop_tray_icon_gtk(self) -> None:
+        _ensure_gi_importable()
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import Gtk, AyatanaAppIndicator3
+
+        stop_icon_path = _save_icon_to_temp(_create_stop_icon())
+
+        indicator = AyatanaAppIndicator3.Indicator.new(
+            "h4kshot-stop",
+            stop_icon_path,
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        indicator.set_title("Stop Recording")
+
+        menu = Gtk.Menu()
+        item_stop = Gtk.MenuItem(label="⏹  Stop Recording")
+        item_stop.connect("activate", lambda _: self.toggle_recording())
+        menu.append(item_stop)
+        menu.show_all()
+        indicator.set_menu(menu)
+
+        self._stop_indicator = indicator
+
+    def _hide_stop_tray_icon(self) -> None:
+        """Remove the stop-recording tray icon.
+
+        MUST be called on the GTK main thread.
+        """
+        if self._stop_indicator is not None:
+            try:
+                _ensure_gi_importable()
+                import gi
+                gi.require_version("AyatanaAppIndicator3", "0.1")
+                from gi.repository import AyatanaAppIndicator3
+                self._stop_indicator.set_status(
+                    AyatanaAppIndicator3.IndicatorStatus.PASSIVE
+                )
+            except Exception:
+                pass
+            self._stop_indicator = None
 
     # ------------------------------------------------------------------ #
     # Notifications (best-effort)
@@ -477,6 +550,8 @@ class H4KShotApp:
         gi.require_version("Gtk", "3.0")
         gi.require_version("AyatanaAppIndicator3", "0.1")
         from gi.repository import Gtk, AyatanaAppIndicator3
+
+        self._using_gtk = True
 
         # Save icon to temp file (AppIndicator needs a file path)
         icon_path = _save_icon_to_temp()
