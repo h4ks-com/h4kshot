@@ -133,12 +133,15 @@ class H4KShotApp:
             except Exception as e:
                 self._notify(f"Screenshot failed: {e}")
 
-        # Show toolbar; the user picks mode & triggers capture
-        threading.Thread(
-            target=show_capture_toolbar,
-            args=(_on_screenshot, lambda m, r: self._start_recording(m, r)),
-            daemon=True,
-        ).start()
+        # The toolbar creates GTK windows, so it MUST run on the GTK main
+        # thread.  When called from a hotkey listener (background thread) we
+        # schedule it via GLib.idle_add; otherwise call directly.
+        def _show():
+            show_capture_toolbar(
+                _on_screenshot, lambda m, r: self._start_recording(m, r)
+            )
+
+        self._run_on_gtk_thread(_show)
 
     # ------------------------------------------------------------------ #
     # Screen recording
@@ -189,8 +192,12 @@ class H4KShotApp:
             self._notify("Recording stopped – uploading…")
             threading.Thread(target=self._upload_and_copy, args=(output,), daemon=True).start()
         else:
-            # When triggered via hotkey (not toolbar), start fullscreen recording
-            self._start_recording(MODE_FULLSCREEN, None)
+            # When triggered via hotkey (not toolbar), start fullscreen recording.
+            # _start_recording touches GTK (shows stop tray icon), so schedule
+            # on the main thread.
+            self._run_on_gtk_thread(
+                lambda: self._start_recording(MODE_FULLSCREEN, None)
+            )
 
         # Update GTK tray menu items
         self._run_on_gtk_thread(self._update_gtk_record_items)
