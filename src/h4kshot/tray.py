@@ -169,7 +169,6 @@ class H4KShotApp:
             self._recorder = ScreenRecorder(region=rec_region)
             self._recorder.start()
             self._is_recording = True
-            self._notify("Recording started… (use hotkey, tray, or ⏹ button to stop)")
 
             # Show a second tray icon (red circle) for stopping
             self._run_on_gtk_thread(self._show_stop_tray_icon)
@@ -255,12 +254,16 @@ class H4KShotApp:
         indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
         indicator.set_title("Stop Recording")
 
+        # AppIndicator requires a menu, but we make it a single item so
+        # left-click opens a one-entry menu (instant stop).  Middle-click
+        # triggers the item directly via set_secondary_activate_target.
         menu = Gtk.Menu()
         item_stop = Gtk.MenuItem(label="⏹  Stop Recording")
         item_stop.connect("activate", lambda _: self.toggle_recording())
         menu.append(item_stop)
         menu.show_all()
         indicator.set_menu(menu)
+        indicator.set_secondary_activate_target(item_stop)
 
         self._stop_indicator = indicator
 
