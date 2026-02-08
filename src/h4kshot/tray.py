@@ -9,8 +9,16 @@ from pathlib import Path
 
 from h4kshot.clipboard import copy_to_clipboard
 from h4kshot.config import load_config, save_config
+from h4kshot.overlay import (
+    CaptureRegion,
+    MODE_AREA,
+    MODE_FULLSCREEN,
+    MODE_WINDOW,
+    show_capture_toolbar,
+    show_stop_button,
+)
 from h4kshot.recorder import ScreenRecorder
-from h4kshot.screenshot import capture_screenshot
+from h4kshot.screenshot import capture_region, capture_screenshot
 from h4kshot.uploader import upload_file
 
 
@@ -73,6 +81,7 @@ class H4KShotApp:
         self._is_recording = False
         self._hotkey_listener = None
         self._tray_icon = None
+        self._stop_button = None  # floating red stop button
 
     # ------------------------------------------------------------------ #
     # Upload helper
@@ -96,32 +105,82 @@ class H4KShotApp:
     # Screenshot
     # ------------------------------------------------------------------ #
     def take_screenshot(self) -> None:
-        """Capture a screenshot, upload it, and copy the URL."""
-        try:
-            path = capture_screenshot()
-            threading.Thread(target=self._upload_and_copy, args=(path,), daemon=True).start()
-        except Exception as e:
-            self._notify(f"Screenshot failed: {e}")
+        """Show the capture toolbar and take a screenshot based on mode."""
+
+        def _on_screenshot(mode: str, region: CaptureRegion | None):
+            try:
+                if mode == MODE_AREA and region:
+                    path = capture_region(region.x, region.y, region.width, region.height)
+                else:
+                    path = capture_screenshot()
+                threading.Thread(
+                    target=self._upload_and_copy, args=(path,), daemon=True
+                ).start()
+            except Exception as e:
+                self._notify(f"Screenshot failed: {e}")
+
+        # Show toolbar; the user picks mode & triggers capture
+        threading.Thread(
+            target=show_capture_toolbar,
+            args=(_on_screenshot, lambda m, r: self._start_recording(m, r)),
+            daemon=True,
+        ).start()
 
     # ------------------------------------------------------------------ #
     # Screen recording
     # ------------------------------------------------------------------ #
+    def _start_recording(self, mode: str, region: CaptureRegion | None) -> None:
+        """Start recording (called from overlay toolbar)."""
+        if self._is_recording:
+            return
+        try:
+            rec_region = None
+            if mode == MODE_AREA and region:
+                rec_region = (region.x, region.y, region.width, region.height)
+            elif mode == MODE_WINDOW and region:
+                rec_region = (region.x, region.y, region.width, region.height)
+
+            self._recorder = ScreenRecorder(region=rec_region)
+            self._recorder.start()
+            self._is_recording = True
+            self._notify("Recording started… (use hotkey, tray, or ⏹ button to stop)")
+
+            # Show floating red stop button
+            try:
+                self._stop_button = show_stop_button(self.toggle_recording)
+            except Exception:
+                pass  # non-fatal if the button fails to display
+
+        except RuntimeError as e:
+            self._notify(str(e))
+
+        self._update_gtk_record_items()
+        if self._tray_icon and hasattr(self._tray_icon, "update_menu"):
+            try:
+                self._tray_icon.update_menu()
+            except Exception:
+                pass
+
     def toggle_recording(self) -> None:
         """Start or stop screen recording."""
         if self._is_recording and self._recorder:
             self._is_recording = False
             output = self._recorder.stop()
+            self._recorder = None
+
+            # Hide the floating stop button
+            if self._stop_button:
+                try:
+                    self._stop_button.destroy()
+                except Exception:
+                    pass
+                self._stop_button = None
+
             self._notify("Recording stopped – uploading…")
             threading.Thread(target=self._upload_and_copy, args=(output,), daemon=True).start()
-            self._recorder = None
         else:
-            try:
-                self._recorder = ScreenRecorder()
-                self._recorder.start()
-                self._is_recording = True
-                self._notify("Recording started… (use hotkey or tray menu to stop)")
-            except RuntimeError as e:
-                self._notify(str(e))
+            # When triggered via hotkey (not toolbar), start fullscreen recording
+            self._start_recording(MODE_FULLSCREEN, None)
 
         # Update GTK tray menu items if they exist
         self._update_gtk_record_items()
@@ -397,7 +456,7 @@ class H4KShotApp:
 
         icon_image = _create_default_icon()
         menu = pystray.Menu(
-            MenuItem("Take Screenshot", lambda icon, item: self.take_screenshot()),
+            MenuItem("📷  Capture…", lambda icon, item: self.take_screenshot()),
             MenuItem(
                 lambda item: "⏹️ Stop Recording" if self._is_recording else "🎥 Start Recording",
                 lambda icon, item: self.toggle_recording(),
@@ -433,9 +492,9 @@ class H4KShotApp:
         # Build menu
         menu = Gtk.Menu()
 
-        item_screenshot = Gtk.MenuItem(label="📸  Take Screenshot")
-        item_screenshot.connect("activate", lambda _: self.take_screenshot())
-        menu.append(item_screenshot)
+        item_capture = Gtk.MenuItem(label="📷  Capture…")
+        item_capture.connect("activate", lambda _: self.take_screenshot())
+        menu.append(item_capture)
 
         item_record = Gtk.MenuItem(label="🎥  Start Recording")
         item_stop = Gtk.MenuItem(label="⏹️  Stop Recording")

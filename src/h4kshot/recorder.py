@@ -28,46 +28,54 @@ def _get_ffmpeg() -> str:
     return path
 
 
-def _build_ffmpeg_cmd(output_path: str, framerate: int = 30) -> list[str]:
-    """Build the ffmpeg command for screen capture on the current platform."""
+def _build_ffmpeg_cmd(
+    output_path: str,
+    framerate: int = 30,
+    region: tuple[int, int, int, int] | None = None,
+) -> list[str]:
+    """Build the ffmpeg command for screen capture on the current platform.
+
+    Args:
+        output_path: Path to the output video file.
+        framerate: Capture framerate.
+        region: Optional (x, y, width, height) to capture a subregion.
+    """
     ffmpeg = _get_ffmpeg()
     system = platform.system()
 
     if system == "Linux":
         display = os.environ.get("DISPLAY", ":0")
-        return [
-            ffmpeg, "-y",
-            "-f", "x11grab",
-            "-framerate", str(framerate),
-            "-i", display,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            output_path,
-        ]
+        cmd = [ffmpeg, "-y", "-f", "x11grab", "-framerate", str(framerate)]
+        if region:
+            x, y, w, h = region
+            cmd += ["-video_size", f"{w}x{h}"]
+            cmd += ["-i", f"{display}+{x},{y}"]
+        else:
+            cmd += ["-i", display]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", output_path]
+        return cmd
+
     elif system == "Darwin":
-        # macOS: use avfoundation, device 1 is screen
-        return [
-            ffmpeg, "-y",
-            "-f", "avfoundation",
-            "-framerate", str(framerate),
-            "-i", "1:none",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            output_path,
-        ]
+        # macOS: avfoundation doesn't natively support region capture,
+        # so we capture full screen and crop with a video filter.
+        cmd = [ffmpeg, "-y", "-f", "avfoundation", "-framerate", str(framerate),
+               "-i", "1:none"]
+        if region:
+            x, y, w, h = region
+            cmd += ["-vf", f"crop={w}:{h}:{x}:{y}"]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", output_path]
+        return cmd
+
     elif system == "Windows":
-        return [
-            ffmpeg, "-y",
-            "-f", "gdigrab",
-            "-framerate", str(framerate),
-            "-i", "desktop",
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            output_path,
-        ]
+        cmd = [ffmpeg, "-y", "-f", "gdigrab", "-framerate", str(framerate)]
+        if region:
+            x, y, w, h = region
+            cmd += ["-offset_x", str(x), "-offset_y", str(y),
+                    "-video_size", f"{w}x{h}"]
+        cmd += ["-i", "desktop",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", output_path]
+        return cmd
+
     else:
         raise RuntimeError(f"Unsupported platform for recording: {system}")
 
@@ -75,7 +83,18 @@ def _build_ffmpeg_cmd(output_path: str, framerate: int = 30) -> list[str]:
 class ScreenRecorder:
     """Manages an ffmpeg screen recording process with auto size-limit cutoff."""
 
-    def __init__(self, output_path: str | Path | None = None, framerate: int = 30):
+    def __init__(
+        self,
+        output_path: str | Path | None = None,
+        framerate: int = 30,
+        region: tuple[int, int, int, int] | None = None,
+    ):
+        """
+        Args:
+            output_path: Path for the output video. If None, uses a temp file.
+            framerate: Capture framerate.
+            region: Optional (x, y, width, height) to capture a subregion.
+        """
         if output_path is None:
             fd, tmp = tempfile.mkstemp(suffix=".mp4", prefix="h4kshot_rec_")
             os.close(fd)
@@ -84,6 +103,7 @@ class ScreenRecorder:
             self.output_path = Path(output_path)
 
         self.framerate = framerate
+        self.region = region
         self._process: subprocess.Popen | None = None
         self._monitor_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -103,7 +123,7 @@ class ScreenRecorder:
         if self.is_recording:
             return
 
-        cmd = _build_ffmpeg_cmd(str(self.output_path), self.framerate)
+        cmd = _build_ffmpeg_cmd(str(self.output_path), self.framerate, self.region)
         # Suppress ffmpeg output; send 'q' to stdin to stop gracefully
         self._process = subprocess.Popen(
             cmd,
