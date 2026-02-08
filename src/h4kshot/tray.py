@@ -119,9 +119,29 @@ class H4KShotApp:
                 self._recorder = ScreenRecorder()
                 self._recorder.start()
                 self._is_recording = True
-                self._notify("Recording started…")
+                self._notify("Recording started… (use hotkey or tray menu to stop)")
             except RuntimeError as e:
                 self._notify(str(e))
+
+        # Update GTK tray menu items if they exist
+        self._update_gtk_record_items()
+        # Update pystray menu (forces re-render of dynamic label)
+        if self._tray_icon and hasattr(self._tray_icon, 'update_menu'):
+            try:
+                self._tray_icon.update_menu()
+            except Exception:
+                pass
+
+    def _update_gtk_record_items(self) -> None:
+        """Sync GTK menu item sensitivity with recording state."""
+        try:
+            rec = getattr(self, '_gtk_item_record', None)
+            stop = getattr(self, '_gtk_item_stop', None)
+            if rec and stop:
+                rec.set_sensitive(not self._is_recording)
+                stop.set_sensitive(self._is_recording)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Notifications (best-effort)
@@ -200,16 +220,27 @@ class H4KShotApp:
         record_combo = {str(k) for k in record_keys}
 
         current_keys: set[str] = set()
+        # Sort combos so the more specific (longer) one is checked first.
+        # This prevents <alt>+<print_screen> from firing when the user
+        # actually pressed <ctrl>+<alt>+<print_screen>.
+        combos = sorted(
+            [
+                (screenshot_combo, self.take_screenshot),
+                (record_combo, self.toggle_recording),
+            ],
+            key=lambda pair: len(pair[0]),
+            reverse=True,
+        )
 
         def on_press(key):
             try:
                 current_keys.add(str(key))
             except Exception:
                 pass
-            if screenshot_combo.issubset(current_keys):
-                self.take_screenshot()
-            elif record_combo.issubset(current_keys):
-                self.toggle_recording()
+            for combo, action in combos:
+                if combo.issubset(current_keys):
+                    action()
+                    break
 
         def on_release(key):
             try:
@@ -367,7 +398,10 @@ class H4KShotApp:
         icon_image = _create_default_icon()
         menu = pystray.Menu(
             MenuItem("Take Screenshot", lambda icon, item: self.take_screenshot()),
-            MenuItem("Toggle Recording", lambda icon, item: self.toggle_recording()),
+            MenuItem(
+                lambda item: "⏹️ Stop Recording" if self._is_recording else "🎥 Start Recording",
+                lambda icon, item: self.toggle_recording(),
+            ),
             pystray.Menu.SEPARATOR,
             MenuItem("Change Keybindings", lambda icon, item: self._open_keybinding_dialog()),
             pystray.Menu.SEPARATOR,
@@ -403,9 +437,26 @@ class H4KShotApp:
         item_screenshot.connect("activate", lambda _: self.take_screenshot())
         menu.append(item_screenshot)
 
-        item_record = Gtk.MenuItem(label="🎥  Toggle Recording")
-        item_record.connect("activate", lambda _: self.toggle_recording())
+        item_record = Gtk.MenuItem(label="🎥  Start Recording")
+        item_stop = Gtk.MenuItem(label="⏹️  Stop Recording")
+        item_stop.set_sensitive(False)  # disabled until recording starts
+
+        def _on_start_record(_widget):
+            self.toggle_recording()
+            if self._is_recording:
+                item_record.set_sensitive(False)
+                item_stop.set_sensitive(True)
+
+        def _on_stop_record(_widget):
+            self.toggle_recording()
+            if not self._is_recording:
+                item_record.set_sensitive(True)
+                item_stop.set_sensitive(False)
+
+        item_record.connect("activate", _on_start_record)
+        item_stop.connect("activate", _on_stop_record)
         menu.append(item_record)
+        menu.append(item_stop)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -421,6 +472,10 @@ class H4KShotApp:
 
         menu.show_all()
         indicator.set_menu(menu)
+
+        # Store refs so hotkey toggle can update menu state too
+        self._gtk_item_record = item_record
+        self._gtk_item_stop = item_stop
 
         self._tray_icon = indicator
         Gtk.main()
